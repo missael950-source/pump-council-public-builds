@@ -1,0 +1,88 @@
+name: Pinned public SPL Token build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: pinned-public-spl-token-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      VERIFY_IMAGE: solanafoundation/solana-verifiable-build@sha256:d7079331a2696eca570fbeeb5caa556cb09084f89ca96f0a0edb86e1cf83e165
+    steps:
+      - name: Obtain and verify public pinned sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS" = Linux
+          test "$(uname -m)" = x86_64
+          mkdir build-inputs
+          curl --fail --location --proto '=https' --max-time 60 --max-filesize 67108864             'https://codeload.github.com/solana-program/token/tar.gz/a94dd19750dc3b2409f73e15bb74754935b2a489'             --output build-inputs/token.tar.gz
+          curl --fail --location --proto '=https' --max-time 60 --max-filesize 5000000             'https://static.crates.io/crates/solana-verify/solana-verify-0.5.0.crate'             --output build-inputs/solana-verify.crate
+          echo '36a3b523c1df34cb7f270a779092af5f41c954166a2e3e8a1424fda578afc53c  build-inputs/token.tar.gz' | sha256sum --check --strict
+          echo '3878205c9136d0a3ffaa4eb398391d8cd42768059ce492f3eb1a7a8a40957e00  build-inputs/solana-verify.crate' | sha256sum --check --strict
+          python3 - <<'PY'
+          import pathlib, tarfile
+          root = pathlib.Path('build-inputs').resolve()
+          for name in ('token.tar.gz', 'solana-verify.crate'):
+              with tarfile.open(root / name) as archive:
+                  archive.extractall(root, filter='data')
+          PY
+          sha256sum build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489/Cargo.lock
+          sha256sum build-inputs/solana-verify-0.5.0/Cargo.lock
+
+      - name: Build the pinned verification tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.93.1 --profile minimal
+          cargo +1.93.1 install --locked --jobs 2             --path "$PWD/build-inputs/solana-verify-0.5.0" --root "$PWD/build-tools"
+          rustc +1.93.1 --version --verbose
+          "$PWD/build-tools/bin/solana-verify" --version
+          sha256sum build-tools/bin/solana-verify
+
+      - name: Rebuild the public token program in the pinned Linux image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "$VERIFY_IMAGE"
+          docker image inspect "$VERIFY_IMAGE" --format '{{json .RepoDigests}} {{.Id}}'
+          "$PWD/build-tools/bin/solana-verify" build             --mount-directory "$PWD/build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489"             --library-name pinocchio_token_program             --base-image "$VERIFY_IMAGE"             --cargo-build-sbf-args='--tools-version v1.54'
+          sha256sum build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489/Cargo.lock
+
+      - name: Retain bounded build bytes and hashes in the job log
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, pathlib
+          path = pathlib.Path('build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489/target/deploy/pinocchio_token_program.so')
+          assert path.is_file() and not path.is_symlink()
+          assert 0 < path.stat().st_size <= 2_097_152
+          data = path.read_bytes()
+          assert data[:4] == b'\x7fELF'
+          report = {
+              'profile': 'pinned-public-program-build-v1',
+              'source': 'https://github.com/solana-program/token',
+              'commit': 'a94dd19750dc3b2409f73e15bb74754935b2a489',
+              'library': 'pinocchio_token_program',
+              'bytes': len(data),
+              'sha256': hashlib.sha256(data).hexdigest(),
+              'zeroTrimmedLookupSha256': hashlib.sha256(data.rstrip(b'\0')).hexdigest(),
+              'liveTradingAuthorized': False,
+              'deploymentAccepted': False,
+          }
+          print('PUMP_COUNCIL_BUILD_REPORT ' + json.dumps(report, sort_keys=True))
+          print('PUMP_COUNCIL_BUILD_BYTES_BEGIN')
+          text = base64.b64encode(data).decode('ascii')
+          for offset in range(0, len(text), 512):
+              print(text[offset:offset + 512])
+          print('PUMP_COUNCIL_BUILD_BYTES_END')
+          PY

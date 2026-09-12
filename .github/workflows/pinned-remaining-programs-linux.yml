@@ -1,0 +1,162 @@
+name: Pinned public ATA and Token-2022 builds
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: pinned-public-remaining-programs-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        program: [ata, token2022]
+    env:
+      PROGRAM: ${{ matrix.program }}
+    steps:
+      - name: Select the immutable public inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS" = Linux
+          test "$(uname -m)" = x86_64
+          case "$PROGRAM" in
+            ata)
+              REPOSITORY=solana-labs/solana-program-library
+              COMMIT=c00194d2257302f028f44a403c6dee95c0f9c3bc
+              ARCHIVE_SHA256=9f288465f42c9b99cfacb745b5a4b3e57a6cf6b718ee3cf87a3ea998ac027587
+              IMAGE_SHA256=ee9ad7809009a99a70f659f7cba959e0c3c124e10f771b524914fd42f2b605a8
+              LIBRARY=spl_associated_token_account
+              MANIFEST=associated-token-account/program/Cargo.toml
+              REFERENCE_BYTES=105032
+              REFERENCE_SHA256=6804554e69fd3a58caa191dc4a58f4c67223d30ca28ab8987f39fc18d2f7374d
+              ;;
+            token2022)
+              REPOSITORY=solana-program/token-2022
+              COMMIT=9bc02757f600ffe754746708a8a072bcd49d1260
+              ARCHIVE_SHA256=c48b97616e5a2bdcf610b5b0df11b940279cfa2a3cfab2b4fae582ab6c642142
+              IMAGE_SHA256=8faa93c144f595756148a20fb0e6151eff4d869726e52520119406a944994101
+              LIBRARY=spl_token_2022
+              MANIFEST=program/Cargo.toml
+              REFERENCE_BYTES=632560
+              REFERENCE_SHA256=9bbf90b30e06778ca0feca100b29f0eeb9be576ae024f6323cc207308f51a5d1
+              ;;
+            *) exit 64 ;;
+          esac
+          for name in REPOSITORY COMMIT ARCHIVE_SHA256 IMAGE_SHA256 LIBRARY MANIFEST REFERENCE_BYTES REFERENCE_SHA256; do
+            printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
+          done
+
+      - name: Obtain and verify only the public source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir build-inputs
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --retry 0 --max-time 60 --max-filesize 67108864 \
+            "https://codeload.github.com/$REPOSITORY/tar.gz/$COMMIT" \
+            --output build-inputs/source.tar.gz
+          printf '%s  build-inputs/source.tar.gz\n' "$ARCHIVE_SHA256" | sha256sum --check --strict
+          python3 - <<'PY'
+          import os, pathlib, tarfile
+          root = pathlib.Path('build-inputs').resolve()
+          with tarfile.open(root / 'source.tar.gz') as archive:
+              archive.extractall(root, filter='data')
+          expected = os.environ['REPOSITORY'].split('/')[1] + '-' + os.environ['COMMIT']
+          source = root / expected
+          assert source.is_dir() and not source.is_symlink()
+          source.rename(root / 'source')
+          PY
+          test -f "build-inputs/source/$MANIFEST"
+          sha256sum build-inputs/source/Cargo.lock > build-inputs/lock-before.sha256
+          cat build-inputs/lock-before.sha256
+
+      - name: Compile the exact program with the declared toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="solanafoundation/solana-verifiable-build@sha256:$IMAGE_SHA256"
+          docker pull --platform linux/amd64 "$IMAGE"
+          docker image inspect "$IMAGE" --format '{{json .RepoDigests}} {{.Id}}'
+          docker run --rm --interactive --platform linux/amd64 --cpus 2 --memory 6g \
+            --env PROGRAM --env MANIFEST --env CARGO_BUILD_JOBS=2 --env CARGO_NET_RETRY=0 \
+            --volume "$PWD/build-inputs/source:/build" --workdir / "$IMAGE" bash -s <<'BUILD'
+          set -euo pipefail
+          RUSTUP_TOOLCHAIN="$(rustup show active-toolchain | awk '{print $1}')"
+          test -n "$RUSTUP_TOOLCHAIN"
+          export RUSTUP_TOOLCHAIN
+          if [ "$PROGRAM" = token2022 ]; then
+            rustup toolchain install 1.93.0 --profile minimal
+            export RUSTUP_TOOLCHAIN=1.93.0
+          fi
+          cd /build
+          rustc --version --verbose
+          cargo --version
+          solana --version
+          if [ "$PROGRAM" = ata ]; then
+            solana --version | grep -E '^solana-cli 1\.10\.33([[:space:]]|$)'
+            cargo build-bpf --version | tee /tmp/build-cli-version.txt
+            grep -F 'bpf-tools v1.27' /tmp/build-cli-version.txt
+          else
+            solana --version | grep -E '^solana-cli 3\.1\.8([[:space:]]|$)'
+            cargo build-sbf --version
+          fi
+          sha256sum Cargo.lock > /tmp/program-lock-before.sha256
+          cargo fetch --locked --manifest-path "$MANIFEST"
+          sha256sum --check --strict /tmp/program-lock-before.sha256
+          if [ "$PROGRAM" = ata ]; then
+            cargo build-bpf --offline --manifest-path "$MANIFEST" -- --frozen --locked
+          else
+            CARGO_NET_OFFLINE=true cargo build-sbf --tools-version v1.52 --manifest-path "$MANIFEST" -- --frozen --locked
+          fi
+          sha256sum --check --strict /tmp/program-lock-before.sha256
+          BUILD
+
+      - name: Verify the source lock even if compilation fails
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f build-inputs/lock-before.sha256 ]; then
+            sha256sum --check --strict build-inputs/lock-before.sha256
+          fi
+
+      - name: Retain original build bytes and compare the public release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib
+          path = pathlib.Path('build-inputs/source/target/deploy') / (os.environ['LIBRARY'] + '.so')
+          assert path.is_file() and not path.is_symlink()
+          assert 64 <= path.stat().st_size <= 2_097_152
+          data = path.read_bytes()
+          assert data[:4] == b'\x7fELF'
+          report = {
+              'profile': 'pinned-public-program-build-v1',
+              'source': 'https://github.com/' + os.environ['REPOSITORY'],
+              'commit': os.environ['COMMIT'],
+              'library': os.environ['LIBRARY'],
+              'bytes': len(data),
+              'sha256': hashlib.sha256(data).hexdigest(),
+              'zeroTrimmedLookupSha256': hashlib.sha256(data.rstrip(b'\0')).hexdigest(),
+              'liveTradingAuthorized': False,
+              'deploymentAccepted': False,
+          }
+          print('PUMP_COUNCIL_BUILD_REPORT ' + json.dumps(report, sort_keys=True))
+          print('PUMP_COUNCIL_BUILD_BYTES_BEGIN')
+          encoded = base64.b64encode(data).decode('ascii')
+          for offset in range(0, len(encoded), 512):
+              print(encoded[offset:offset + 512])
+          print('PUMP_COUNCIL_BUILD_BYTES_END')
+          matched = len(data) == int(os.environ['REFERENCE_BYTES']) and report['sha256'] == os.environ['REFERENCE_SHA256']
+          print('PUBLIC_RELEASE_COMPARISON ' + json.dumps({'fullBytesMatch': matched, 'referenceSha256': os.environ['REFERENCE_SHA256']}, sort_keys=True))
+          assert matched, 'Unmodified build differs from the retained official release; retain this failed attempt for analysis'
+          PY

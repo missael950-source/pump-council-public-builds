@@ -46,6 +46,7 @@ jobs:
           cargo +1.93.1 install --locked --jobs 2             --path "$PWD/build-inputs/solana-verify-0.5.0" --root "$PWD/build-tools"
           rustc +1.93.1 --version --verbose
           "$PWD/build-tools/bin/solana-verify" --version
+          "$PWD/build-tools/bin/solana-verify" build --help
           sha256sum build-tools/bin/solana-verify
 
       - name: Rebuild the public token program in the pinned Linux image
@@ -54,7 +55,11 @@ jobs:
           set -euo pipefail
           docker pull --platform linux/amd64 "$VERIFY_IMAGE"
           docker image inspect "$VERIFY_IMAGE" --format '{{json .RepoDigests}} {{.Id}}'
-          "$PWD/build-tools/bin/solana-verify" build             --mount-directory "$PWD/build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489"             --library-name pinocchio_token_program             --base-image "$VERIFY_IMAGE"             --cargo-build-sbf-args='--tools-version v1.54'
+          "$PWD/build-tools/bin/solana-verify" build \
+            "$PWD/build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489" \
+            --library-name pinocchio_token_program \
+            --base-image "$VERIFY_IMAGE" \
+            --cargo-build-sbf-args='--tools-version v1.54'
           sha256sum build-inputs/token-a94dd19750dc3b2409f73e15bb74754935b2a489/Cargo.lock
 
       - name: Retain bounded build bytes and hashes in the job log
